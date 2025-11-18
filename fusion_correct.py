@@ -8,12 +8,33 @@ import numpy as np
 import cv2
 from scipy.spatial import cKDTree
 
+ORIGINAL_WIDTH = 1600
+ORIGINAL_HEIGHT = 1200
 
-def filter_depth_geometric(depth_ref, confidence_ref, depth_src_list, 
-                          extrinsics_ref, extrinsics_src_list, 
+
+def _maybe_scale_intrinsic(intrinsic, target_size=(640, 512)):
+    """Scale intrinsic matrix if it still corresponds to the original DTU size."""
+
+    if intrinsic is None:
+        return None
+
+    target_width, target_height = target_size
+    if intrinsic[0, 2] <= target_width and intrinsic[1, 2] <= target_height:
+        return intrinsic
+
+    scale_w = target_width / ORIGINAL_WIDTH
+    scale_h = target_height / ORIGINAL_HEIGHT
+    scaled = intrinsic.copy()
+    scaled[0, :] *= scale_w
+    scaled[1, :] *= scale_h
+    return scaled
+
+
+def filter_depth_geometric(depth_ref, confidence_ref, depth_src_list,
+                          extrinsics_ref, extrinsics_src_list,
                           intrinsic_ref, intrinsic_src_list,
                           depth_threshold=0.01, conf_threshold=0.3,
-                          num_consistent=3):
+                          num_consistent=3, target_size=(640, 512)):
     """
     Filter depth map using geometric consistency across multiple views
     """
@@ -30,6 +51,7 @@ def filter_depth_geometric(depth_ref, confidence_ref, depth_src_list,
     depth_ref_flat = depth_ref.reshape(-1)
     
     # Back-project to camera coordinates
+    intrinsic_ref = _maybe_scale_intrinsic(intrinsic_ref, target_size)
     K_inv = np.linalg.inv(intrinsic_ref)
     cam_coords = K_inv @ pixels_ref * depth_ref_flat
     
@@ -39,9 +61,10 @@ def filter_depth_geometric(depth_ref, confidence_ref, depth_src_list,
     world_coords = extrinsic_ref_inv @ cam_coords_homo
     
     # Check consistency with each source view
-    for depth_src, extrinsic_src, intrinsic_src in zip(depth_src_list, 
-                                                        extrinsics_src_list, 
+    for depth_src, extrinsic_src, intrinsic_src in zip(depth_src_list,
+                                                        extrinsics_src_list,
                                                         intrinsic_src_list):
+        intrinsic_src = _maybe_scale_intrinsic(intrinsic_src, target_size)
         # Project to source view
         cam_coords_src = extrinsic_src @ world_coords
         pixels_src = intrinsic_src @ cam_coords_src[:3, :]
@@ -105,6 +128,7 @@ def depth_to_points_filtered(depth_map, intrinsic, extrinsic, img_path, mask=Non
     pixels = np.stack([x, y, np.ones_like(x)], axis=0).astype(np.float32)
     depths = depth_map[valid_mask]
     
+    intrinsic = _maybe_scale_intrinsic(intrinsic, target_size)
     K_inv = np.linalg.inv(intrinsic)
     cam_coords = K_inv @ pixels * depths
     cam_coords_homo = np.vstack([cam_coords, np.ones((1, len(depths)))])
