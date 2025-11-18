@@ -26,6 +26,8 @@ class DTUDataset(Dataset):
         self.num_views = num_views
         self.img_height = img_height
         self.img_width = img_width
+        self._scale_w = self.img_width / 1600.0
+        self._scale_h = self.img_height / 1200.0
         
         # Dataset folders
         self.rectified_dir = os.path.join(root_dir, 'Rectified')
@@ -263,6 +265,9 @@ class DTUDataset(Dataset):
                     intrinsic[2, 2] = 1
                     extrinsic = np.eye(4, dtype=np.float32)
             
+            intrinsic = intrinsic.copy()
+            intrinsic[0, :] *= self._scale_w
+            intrinsic[1, :] *= self._scale_h
             intrinsics.append(torch.from_numpy(intrinsic))
             extrinsics.append(torch.from_numpy(extrinsic))
         

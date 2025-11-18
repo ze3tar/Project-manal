@@ -5,6 +5,27 @@ import numpy as np
 from mtmvsnet_model import MTMVSNet
 from data_loader import load_images_and_camera_params
 
+ORIGINAL_WIDTH = 1600
+ORIGINAL_HEIGHT = 1200
+
+
+def _maybe_scale_intrinsic(intrinsic, target_size=(640, 512)):
+    """Scale camera intrinsics if needed after resizing to target size."""
+
+    if intrinsic is None:
+        return None
+
+    target_width, target_height = target_size
+    if intrinsic[0, 2] <= target_width and intrinsic[1, 2] <= target_height:
+        return intrinsic
+
+    scale_w = target_width / ORIGINAL_WIDTH
+    scale_h = target_height / ORIGINAL_HEIGHT
+    scaled = intrinsic.copy()
+    scaled[0, :] *= scale_w
+    scaled[1, :] *= scale_h
+    return scaled
+
 def read_all_view_pairs(pair_file_path):
     """Read all reference-source pairs from pair.txt"""
     with open(pair_file_path) as f:
@@ -73,6 +94,7 @@ def depth_to_points(depth_map, intrinsic, extrinsic, img_path, target_size=(640,
     pixels = np.stack([x, y, np.ones_like(x)], axis=0).astype(np.float32)
     depths = depth_map[valid_mask]
     
+    intrinsic = _maybe_scale_intrinsic(intrinsic, target_size)
     K_inv = np.linalg.inv(intrinsic)
     cam_coords = K_inv @ pixels * depths
     cam_coords_homo = np.vstack([cam_coords, np.ones((1, len(depths)))])
@@ -119,8 +141,6 @@ def test_scan_with_fusion(model, scan_path, output_dir, device, max_views=10):
     all_points = []
     all_colors = []
     
-    ORIGINAL_HEIGHT = 1200
-    ORIGINAL_WIDTH = 1600
     TARGET_HEIGHT = 512
     TARGET_WIDTH = 640
     scale_h = TARGET_HEIGHT / ORIGINAL_HEIGHT
