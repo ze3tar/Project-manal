@@ -1,6 +1,7 @@
 """Balanced fusion pipeline for DTU scan29 using MT-MVSNet."""
 
 import os
+import random
 from typing import Dict, List, Tuple
 
 import cv2
@@ -8,6 +9,7 @@ import numpy as np
 import torch
 
 from mtmvsnet_model import MTMVSNet
+from eval_dtu import evaluate_point_cloud
 
 TARGET_HEIGHT = 512
 TARGET_WIDTH = 640
@@ -17,6 +19,7 @@ MIN_CONSISTENT_VIEWS = 2
 VOXEL_SIZE = 0.015  # meters
 MAX_VIEWS = 49
 DEPTH_MAX = 935.0  # millimeters
+LOG_DIR = os.path.join("outputs", "logs")
 
 
 class ViewCache:
@@ -66,6 +69,15 @@ class ViewCache:
             "depth_interval": depth_interval,
         }
         return self.cache[view_idx]
+
+
+def set_random_seeds(seed: int = 0) -> None:
+    """Ensure deterministic sampling for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def read_pair_file(pair_path: str) -> List[Dict[str, List[int]]]:
@@ -133,53 +145,65 @@ def geometric_consistency_mask(
     src_depths_m: List[np.ndarray],
     src_intrinsics: List[np.ndarray],
     src_extrinsics_m: List[np.ndarray],
-) -> np.ndarray:
+) -> Tuple[np.ndarray, int, int]:
+    """Check multi-view geometric consistency following DTU protocol."""
+
     h, w = ref_depth_m.shape
     valid = ref_depth_m > 0
-    if not np.any(valid):
-        return np.zeros_like(ref_depth_m, dtype=bool)
+    num_valid = int(np.count_nonzero(valid))
+    if num_valid == 0:
+        return np.zeros_like(ref_depth_m, dtype=bool), 0, 0
 
     ys, xs = np.where(valid)
     depths = ref_depth_m[valid]
 
     pixels = np.stack([xs, ys, np.ones_like(xs)], axis=0).astype(np.float64)
-    cam_coords = np.linalg.inv(ref_intrinsic) @ pixels * depths
+    cam_coords = np.linalg.inv(ref_intrinsic) @ pixels
+    cam_coords *= depths
     cam_coords_h = np.vstack([cam_coords, np.ones((1, cam_coords.shape[1]))])
     world_coords = np.linalg.inv(ref_extrinsic_m) @ cam_coords_h
 
-    counts = np.zeros(len(xs), dtype=np.int32)
+    counts = np.zeros(xs.shape[0], dtype=np.int32)
 
     for depth_src, intr_src, extr_src in zip(src_depths_m, src_intrinsics, src_extrinsics_m):
         if depth_src is None or intr_src is None or extr_src is None:
             continue
+
         cam_src = extr_src @ world_coords
         zs = cam_src[2]
         positive = zs > 0
         if not np.any(positive):
             continue
-        proj = intr_src @ (cam_src[:3] / zs)
+
+        norm = cam_src[:3] / np.maximum(zs, 1e-6)
+        proj = intr_src @ norm
         u = proj[0]
         v = proj[1]
+
         inside = (u >= 0) & (u < w - 1) & (v >= 0) & (v < h - 1)
-        valid_idx = np.where(positive & inside)[0]
-        if len(valid_idx) == 0:
+        candidate_idx = np.where(positive & inside)[0]
+        if len(candidate_idx) == 0:
             continue
-        sampled = bilinear_sample(depth_src, u[valid_idx], v[valid_idx])
-        depth_valid = sampled > 0
-        if not np.any(depth_valid):
+
+        sampled_depths = bilinear_sample(depth_src, u[candidate_idx], v[candidate_idx])
+        valid_depth = sampled_depths > 0
+        if not np.any(valid_depth):
             continue
-        valid_idx = valid_idx[depth_valid]
-        sampled = sampled[depth_valid]
-        zs_valid = zs[valid_idx]
-        rel_error = np.abs(sampled - zs_valid) / np.maximum(zs_valid, 1e-6)
-        agree = rel_error <= GEOMETRIC_REL_ERROR
-        counts[valid_idx[agree]] += 1
+
+        candidate_idx = candidate_idx[valid_depth]
+        sampled_depths = sampled_depths[valid_depth]
+
+        cam_depths = zs[candidate_idx]
+        relative_error = np.abs(sampled_depths - cam_depths) / np.maximum(cam_depths, 1e-6)
+        agreeing = relative_error <= GEOMETRIC_REL_ERROR
+        counts[candidate_idx[agreeing]] += 1
 
     mask_flat = np.zeros(h * w, dtype=bool)
     valid_flat_indices = np.flatnonzero(valid)
     agreeing = counts >= MIN_CONSISTENT_VIEWS
     mask_flat[valid_flat_indices[agreeing]] = True
-    return mask_flat.reshape(h, w)
+    num_consistent = int(np.count_nonzero(mask_flat))
+    return mask_flat.reshape(h, w), num_valid, num_consistent
 
 
 def depth_to_points(
@@ -233,8 +257,8 @@ def run_depth_estimation(
         ref_idx = pair["ref"]
         if ref_idx in depth_maps:
             continue
-        src_indices = pair["src"]
-        images, intrinsics, extrinsics, depth_values = prepare_batch(cache, ref_idx, src_indices)
+        source_views = pair["src"][:4]
+        images, intrinsics, extrinsics, depth_values = prepare_batch(cache, ref_idx, source_views)
         images = images.to(device)
         intrinsics = intrinsics.to(device)
         extrinsics = extrinsics.to(device)
@@ -243,7 +267,7 @@ def run_depth_estimation(
         with torch.no_grad():
             outputs = model(images, intrinsics, extrinsics, depth_values)
 
-        depth_map = outputs[-1][0][0].cpu().numpy()
+        depth_map = outputs[-1][0][0].cpu().numpy() / 1000.0
         prob_volume = outputs[-1][1][0].cpu()
         confidence = torch.max(prob_volume, dim=0).values.numpy()
 
@@ -258,6 +282,7 @@ def fuse_points(
     view_pairs: List[Dict[str, List[int]]],
     depth_maps: Dict[int, np.ndarray],
     confidences: Dict[int, np.ndarray],
+    log_entries: List[str],
 ) -> Tuple[np.ndarray, np.ndarray]:
     point_list = []
     color_list = []
@@ -267,7 +292,7 @@ def fuse_points(
         if ref_idx not in depth_maps:
             continue
         ref_view = cache.get(ref_idx)
-        depth_m = depth_maps[ref_idx] / 1000.0
+        depth_m = depth_maps[ref_idx]
         confidence = confidences[ref_idx]
         photo_mask = (confidence >= CONFIDENCE_THRESHOLD) & (depth_m > 0)
         if not np.any(photo_mask):
@@ -276,13 +301,14 @@ def fuse_points(
         src_depths = []
         src_intrinsics = []
         src_extrinsics = []
-        for src_idx in pair["src"]:
+        source_views = pair["src"][:4]
+        for src_idx in source_views:
             if src_idx not in depth_maps:
                 src_depths.append(None)
                 src_intrinsics.append(None)
                 src_extrinsics.append(None)
                 continue
-            src_depths.append(depth_maps[src_idx] / 1000.0)
+            src_depths.append(depth_maps[src_idx])
             src_intrinsics.append(cache.get(src_idx)["intrinsic"])
             src_extrinsics.append(cache.get(src_idx)["extrinsic_m"])
 
@@ -290,7 +316,7 @@ def fuse_points(
         if len(valid_src_depths) < MIN_CONSISTENT_VIEWS:
             continue
 
-        geom_mask = geometric_consistency_mask(
+        geom_mask, num_valid_pixels, num_consistent_pixels = geometric_consistency_mask(
             depth_m,
             ref_view["intrinsic"],
             ref_view["extrinsic_m"],
@@ -300,7 +326,23 @@ def fuse_points(
         )
 
         final_mask = photo_mask & geom_mask
-        if not np.any(final_mask):
+        depth_vals = depth_m[photo_mask]
+        if depth_vals.size > 0:
+            depth_min = float(depth_vals.min())
+            depth_max = float(depth_vals.max())
+        else:
+            depth_min = 0.0
+            depth_max = 0.0
+        consistent_count = int(np.count_nonzero(final_mask))
+        log_line = (
+            f"Ref {ref_idx}: depth_range=[{depth_min:.3f}, {depth_max:.3f}]m "
+            f"valid_pixels={num_valid_pixels} consistent_pixels={num_consistent_pixels} "
+            f"accepted_pixels={consistent_count}"
+        )
+        print(log_line)
+        log_entries.append(log_line)
+
+        if consistent_count == 0:
             continue
 
         points, colors = depth_to_points(
@@ -340,6 +382,7 @@ def save_ply(path: str, points: np.ndarray, colors: np.ndarray) -> None:
 
 
 def main() -> None:
+    set_random_seeds(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     scan_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan29")
     pair_path = os.path.join(scan_path, "pair.txt")
@@ -352,12 +395,48 @@ def main() -> None:
     cache = ViewCache(scan_path)
     view_pairs = read_pair_file(pair_path)
 
+    log_entries: List[str] = []
     depth_maps, confidences = run_depth_estimation(model, cache, view_pairs, device)
-    points, colors = fuse_points(cache, view_pairs, depth_maps, confidences)
+    points, colors = fuse_points(cache, view_pairs, depth_maps, confidences, log_entries)
 
     output_path = os.path.join("outputs", "scan29_clean.ply")
     save_ply(output_path, points, colors)
-    print(f"Saved fused point cloud with {len(points)} points to {output_path}")
+    total_points = len(points)
+    print(f"Saved fused point cloud with {total_points} points to {output_path}")
+
+    metrics_output = os.path.join("outputs", "scan29_metrics.txt")
+    gt_candidates = [
+        os.environ.get("DTU_GT_PLY"),
+        os.path.join(scan_path, "scan29_gt.ply"),
+        os.path.join(scan_path, "scan29.ply"),
+    ]
+    gt_path = next((p for p in gt_candidates if p and os.path.exists(p)), None)
+
+    if gt_path:
+        metrics = evaluate_point_cloud(output_path, gt_path)
+    else:
+        metrics = {"Accuracy": float("nan"), "Completeness": float("nan"), "Overall": float("nan")}
+        print("Ground-truth point cloud not found; metrics set to NaN")
+
+    os.makedirs(os.path.dirname(metrics_output), exist_ok=True)
+    with open(metrics_output, "w", encoding="utf-8") as f:
+        f.write(f"Accuracy: {metrics['Accuracy']:.6f}\n")
+        f.write(f"Completeness: {metrics['Completeness']:.6f}\n")
+        f.write(f"Overall: {metrics['Overall']:.6f}\n")
+        f.write(f"Number of points: {total_points}\n")
+    print(f"Saved metrics to {metrics_output}")
+
+    log_entries.append(f"Total points: {total_points}")
+    log_entries.append(
+        f"Metrics - Accuracy: {metrics['Accuracy']:.6f}, Completeness: {metrics['Completeness']:.6f}, Overall: {metrics['Overall']:.6f}"
+    )
+    os.makedirs(LOG_DIR, exist_ok=True)
+    summary_path = os.path.join(LOG_DIR, "scan29_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("Scan29 fusion summary\n")
+        for line in log_entries:
+            f.write(line + "\n")
+    print(f"Saved log summary to {summary_path}")
 
 
 if __name__ == "__main__":
