@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fusion import CostVolumeBuilder
+from fusion_builder import CostVolumeBuilder
 from cost_regularization import CostRegularization3DUNet
 
 class MBPS(nn.Module):

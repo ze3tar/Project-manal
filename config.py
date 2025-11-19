@@ -8,7 +8,7 @@ class TrainingConfig:
     """
     
     # Dataset paths
-    DTU_ROOT = "/project/yuxiaojun/projet3/mvs_training/dtu"  
+    DTU_ROOT = "/root/DTU"  
     CHECKPOINT_DIR = "./checkpoints"  
     LOG_DIR = "./logs"  
     
