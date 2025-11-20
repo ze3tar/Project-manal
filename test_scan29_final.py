@@ -13,10 +13,10 @@ from eval_dtu import evaluate_point_cloud
 
 TARGET_HEIGHT = 512
 TARGET_WIDTH = 640
-CONFIDENCE_THRESHOLD = 0.6
-GEOMETRIC_REL_ERROR = 0.01
+CONFIDENCE_THRESHOLD = 0.2
+GEOMETRIC_REL_ERROR = 0.03
 MIN_CONSISTENT_VIEWS = 2
-VOXEL_SIZE = 0.015  # meters
+VOXEL_SIZE = 0.01  # millimeters
 MAX_VIEWS = 49
 DEPTH_MAX = 935.0  # millimeters
 LOG_DIR = os.path.join("outputs", "logs")
@@ -56,15 +56,11 @@ class ViewCache:
         intrinsic[0, :] *= scale_w
         intrinsic[1, :] *= scale_h
 
-        extrinsic_m = extrinsic.copy()
-        extrinsic_m[:3, 3] /= 1000.0  # convert translation to meters
-
         self.cache[view_idx] = {
             "image_tensor": image_tensor,
             "color_image": color_rgb,
             "intrinsic": intrinsic,
             "extrinsic_mm": extrinsic,
-            "extrinsic_m": extrinsic_m,
             "depth_min": depth_min,
             "depth_interval": depth_interval,
         }
@@ -139,33 +135,33 @@ def bilinear_sample(depth_map: np.ndarray, xs: np.ndarray, ys: np.ndarray) -> np
 
 
 def geometric_consistency_mask(
-    ref_depth_m: np.ndarray,
+    ref_depth_mm: np.ndarray,
     ref_intrinsic: np.ndarray,
-    ref_extrinsic_m: np.ndarray,
-    src_depths_m: List[np.ndarray],
+    ref_extrinsic_mm: np.ndarray,
+    src_depths_mm: List[np.ndarray],
     src_intrinsics: List[np.ndarray],
-    src_extrinsics_m: List[np.ndarray],
+    src_extrinsics_mm: List[np.ndarray],
 ) -> Tuple[np.ndarray, int, int]:
-    """Check multi-view geometric consistency following DTU protocol."""
+    """Check multi-view geometric consistency following DTU protocol in millimeters."""
 
-    h, w = ref_depth_m.shape
-    valid = ref_depth_m > 0
+    h, w = ref_depth_mm.shape
+    valid = ref_depth_mm > 0
     num_valid = int(np.count_nonzero(valid))
     if num_valid == 0:
-        return np.zeros_like(ref_depth_m, dtype=bool), 0, 0
+        return np.zeros_like(ref_depth_mm, dtype=bool), 0, 0
 
     ys, xs = np.where(valid)
-    depths = ref_depth_m[valid]
+    depths = ref_depth_mm[valid]
 
     pixels = np.stack([xs, ys, np.ones_like(xs)], axis=0).astype(np.float64)
     cam_coords = np.linalg.inv(ref_intrinsic) @ pixels
     cam_coords *= depths
     cam_coords_h = np.vstack([cam_coords, np.ones((1, cam_coords.shape[1]))])
-    world_coords = np.linalg.inv(ref_extrinsic_m) @ cam_coords_h
+    world_coords = np.linalg.inv(ref_extrinsic_mm) @ cam_coords_h
 
     counts = np.zeros(xs.shape[0], dtype=np.int32)
 
-    for depth_src, intr_src, extr_src in zip(src_depths_m, src_intrinsics, src_extrinsics_m):
+    for depth_src, intr_src, extr_src in zip(src_depths_mm, src_intrinsics, src_extrinsics_mm):
         if depth_src is None or intr_src is None or extr_src is None:
             continue
 
@@ -207,9 +203,9 @@ def geometric_consistency_mask(
 
 
 def depth_to_points(
-    depth_m: np.ndarray,
+    depth_mm: np.ndarray,
     intrinsic: np.ndarray,
-    extrinsic_m: np.ndarray,
+    extrinsic_mm: np.ndarray,
     color_image: np.ndarray,
     mask: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -217,11 +213,11 @@ def depth_to_points(
         return np.empty((0, 3)), np.empty((0, 3))
 
     ys, xs = np.where(mask)
-    depths = depth_m[mask]
+    depths = depth_mm[mask]
     pixels = np.stack([xs, ys, np.ones_like(xs)], axis=0).astype(np.float64)
     cam_coords = np.linalg.inv(intrinsic) @ pixels * depths
     cam_coords_h = np.vstack([cam_coords, np.ones((1, cam_coords.shape[1]))])
-    world_coords = np.linalg.inv(extrinsic_m) @ cam_coords_h
+    world_coords = np.linalg.inv(extrinsic_mm) @ cam_coords_h
     points = world_coords[:3].T
     colors = color_image[ys, xs].astype(np.float32)
     return points, colors
@@ -253,11 +249,15 @@ def run_depth_estimation(
     depth_maps: Dict[int, np.ndarray] = {}
     confidences: Dict[int, np.ndarray] = {}
 
-    for pair in view_pairs[:MAX_VIEWS]:
-        ref_idx = pair["ref"]
+    all_view_ids = sorted(
+        set([p["ref"] for p in view_pairs] + [sid for p in view_pairs for sid in p["src"][:4]])
+    )
+
+    for ref_idx in all_view_ids[:MAX_VIEWS]:
         if ref_idx in depth_maps:
             continue
-        source_views = pair["src"][:4]
+        pair = next((p for p in view_pairs if p["ref"] == ref_idx), None)
+        source_views = pair["src"][:4] if pair else []
         images, intrinsics, extrinsics, depth_values = prepare_batch(cache, ref_idx, source_views)
         images = images.to(device)
         intrinsics = intrinsics.to(device)
@@ -267,7 +267,7 @@ def run_depth_estimation(
         with torch.no_grad():
             outputs = model(images, intrinsics, extrinsics, depth_values)
 
-        depth_map = outputs[-1][0][0].cpu().numpy() / 1000.0
+        depth_map = outputs[-1][0][0].cpu().numpy()
         prob_volume = outputs[-1][1][0].cpu()
         confidence = torch.max(prob_volume, dim=0).values.numpy()
 
@@ -292,9 +292,9 @@ def fuse_points(
         if ref_idx not in depth_maps:
             continue
         ref_view = cache.get(ref_idx)
-        depth_m = depth_maps[ref_idx]
+        depth_mm = depth_maps[ref_idx]
         confidence = confidences[ref_idx]
-        photo_mask = (confidence >= CONFIDENCE_THRESHOLD) & (depth_m > 0)
+        photo_mask = (confidence >= CONFIDENCE_THRESHOLD) & (depth_mm > 0)
         if not np.any(photo_mask):
             continue
 
@@ -310,23 +310,23 @@ def fuse_points(
                 continue
             src_depths.append(depth_maps[src_idx])
             src_intrinsics.append(cache.get(src_idx)["intrinsic"])
-            src_extrinsics.append(cache.get(src_idx)["extrinsic_m"])
+            src_extrinsics.append(cache.get(src_idx)["extrinsic_mm"])
 
         valid_src_depths = [d for d in src_depths if d is not None]
         if len(valid_src_depths) < MIN_CONSISTENT_VIEWS:
             continue
 
         geom_mask, num_valid_pixels, num_consistent_pixels = geometric_consistency_mask(
-            depth_m,
+            depth_mm,
             ref_view["intrinsic"],
-            ref_view["extrinsic_m"],
+            ref_view["extrinsic_mm"],
             src_depths,
             src_intrinsics,
             src_extrinsics,
         )
 
         final_mask = photo_mask & geom_mask
-        depth_vals = depth_m[photo_mask]
+        depth_vals = depth_mm[photo_mask]
         if depth_vals.size > 0:
             depth_min = float(depth_vals.min())
             depth_max = float(depth_vals.max())
@@ -335,20 +335,24 @@ def fuse_points(
             depth_max = 0.0
         consistent_count = int(np.count_nonzero(final_mask))
         log_line = (
-            f"Ref {ref_idx}: depth_range=[{depth_min:.3f}, {depth_max:.3f}]m "
+            f"Ref {ref_idx}: depth_range=[{depth_min:.1f}, {depth_max:.1f}]mm "
             f"valid_pixels={num_valid_pixels} consistent_pixels={num_consistent_pixels} "
             f"accepted_pixels={consistent_count}"
         )
         print(log_line)
         log_entries.append(log_line)
 
+        print(
+            f"[Fusion] Ref {ref_idx}: {consistent_count} pixels accepted, depth range = [{depth_min:.1f}, {depth_max:.1f}] mm"
+        )
+
         if consistent_count == 0:
             continue
 
         points, colors = depth_to_points(
-            depth_m,
+            depth_mm,
             ref_view["intrinsic"],
-            ref_view["extrinsic_m"],
+            ref_view["extrinsic_mm"],
             ref_view["color_image"],
             final_mask,
         )
