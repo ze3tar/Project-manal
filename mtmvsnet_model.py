@@ -22,7 +22,18 @@ class MTMVSNet(nn.Module):
         self.mbps = MBPS(base_channels=base_channels, num_stages=num_stages)
 
     def forward(self, images, intrinsics, extrinsics, depth_values):
-        """Returns: list of (depth_map, prob_volume, depth_values) tuples"""
+        """
+        Args:
+            images:     (B, V, 3, H, W)
+            intrinsics: (B, V, 3, 3)
+            extrinsics: (B, V, 4, 4)
+            depth_values: (B, D)
+
+        Returns:
+            List of tuples per stage: (depth_pred, prob_volume, depth_values_stage)
+            prob_volume is softmax-normalized over the depth dimension for the
+            exact depth_values_stage used by that stage.
+        """
         B, N, C, H, W = images.shape
 
         all_view_features = []
@@ -57,15 +68,20 @@ class MTMVSNet(nn.Module):
         ref_final_features = self.eaf(enhanced_features[0])
         src_final_features = [enhanced_features[i] for i in range(1, N)]
 
-        stage_to_scale = [3, 2, 1, 0]
+        stage_to_scale = list(reversed(range(len(ref_final_features))))[: self.num_stages]
         results = []
         current_depth_values = depth_values
-        
+
         for stage_idx in range(self.num_stages):
+            if stage_idx >= len(stage_to_scale):
+                raise ValueError(
+                    f"Requested {self.num_stages} stages but only have {len(stage_to_scale)} feature scales"
+                )
+
             scale_idx = stage_to_scale[stage_idx]
             ref_feat = ref_final_features[scale_idx]
             src_feat_list = [src_view[scale_idx] for src_view in src_final_features] if src_final_features else []
-            
+
             try:
                 depth_map, prob_volume, depth_vals = self.mbps._process_single_stage(
                     ref_feat, src_feat_list, intrinsics, extrinsics, current_depth_values, stage_idx
@@ -81,7 +97,7 @@ class MTMVSNet(nn.Module):
                         mode='bilinear', align_corners=False
                     )
                 
-                results.append((depth_map, prob_volume, depth_vals))  # 3-tuple
+                results.append((depth_map, prob_volume, depth_vals))
                 
                 if stage_idx < self.num_stages - 1:
                     current_depth_values = self.mbps._update_depth_values(
