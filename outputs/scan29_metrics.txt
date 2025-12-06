@@ -1,5 +1,3 @@
-Accuracy: 51.378983
-Completeness: 35.072530
-Overall: 43.225756
-NumPredEval: 350000
-NumGTEval: 350000
+version https://git-lfs.github.com/spec/v1
+oid sha256:d6ea53ba347572e1ee778e740187f2aa676bbcfa3c5d4d4feb838f6671afeb62
+size 101
