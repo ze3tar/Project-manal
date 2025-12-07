@@ -44,8 +44,10 @@ def load_images_and_camera_params(scene_path, pair_file_path):
             intrinsic = np.array([list(map(float, line.split())) for line in lines[7:10]])
             
             # FIXED: Scale intrinsics to match resized image
-            intrinsic[0, :] *= scale_w
-            intrinsic[1, :] *= scale_h
+            intrinsic[0, 0] *= scale_w
+            intrinsic[1, 1] *= scale_h
+            intrinsic[0, 2] *= scale_w
+            intrinsic[1, 2] *= scale_h
             
             depth_line = lines[11].split()
             depth_min = float(depth_line[0])

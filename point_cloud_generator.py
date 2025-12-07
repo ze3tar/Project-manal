@@ -27,15 +27,19 @@ def create_point_cloud_from_depth_fixed(depth_map, intrinsic, extrinsic, image=N
     pixels = np.stack((j_grid, i_grid, np.ones_like(j_grid)), axis=-1).reshape(-1, 3).T
 
     inv_K = np.linalg.inv(intrinsic)
-    cam_coords = inv_K @ pixels * depth_map.reshape(1, -1)
+    # Convert to millimeters (network predicts meters) for alignment with GT
+    depth_map_mm = depth_map * 1000.0
+
+    cam_coords = inv_K @ pixels * depth_map_mm.reshape(1, -1)
 
     # Homogeneous coordinates
     cam_coords_hom = np.vstack((cam_coords, np.ones((1, cam_coords.shape[1]))))
-    world_coords = extrinsic @ cam_coords_hom
+    # Extrinsic provided as world → camera; invert to transform into world frame
+    world_coords = np.linalg.inv(extrinsic) @ cam_coords_hom
     points = world_coords[:3].T  # [N, 3]
 
     # Valid depth mask
-    valid = depth_map.reshape(-1) > 0
+    valid = depth_map_mm.reshape(-1) > 0
     points = points[valid]
     print(f"Valid points: {valid.sum()}/{len(valid)}")
 
@@ -128,15 +132,17 @@ def create_point_cloud_from_depth(depth_map, intrinsic, extrinsic, image=None):
     pixels = np.stack((j_grid, i_grid, np.ones_like(j_grid)), axis=-1).reshape(-1, 3).T
 
     inv_K = np.linalg.inv(intrinsic)
-    cam_coords = inv_K @ pixels * depth_map.reshape(1, -1)
+    depth_map_mm = depth_map * 1000.0
+
+    cam_coords = inv_K @ pixels * depth_map_mm.reshape(1, -1)
 
     # Homogeneous coordinates
     cam_coords_hom = np.vstack((cam_coords, np.ones((1, cam_coords.shape[1]))))
-    world_coords = extrinsic @ cam_coords_hom
+    world_coords = np.linalg.inv(extrinsic) @ cam_coords_hom
     points = world_coords[:3].T  # [N, 3]
 
     # Valid depth mask
-    valid = depth_map.reshape(-1) > 0
+    valid = depth_map_mm.reshape(-1) > 0
     points = points[valid]
 
     pcd = o3d.geometry.PointCloud()
