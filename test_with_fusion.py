@@ -22,8 +22,10 @@ def _maybe_scale_intrinsic(intrinsic, target_size=(640, 512)):
     scale_w = target_width / ORIGINAL_WIDTH
     scale_h = target_height / ORIGINAL_HEIGHT
     scaled = intrinsic.copy()
-    scaled[0, :] *= scale_w
-    scaled[1, :] *= scale_h
+    scaled[0, 0] *= scale_w
+    scaled[1, 1] *= scale_h
+    scaled[0, 2] *= scale_w
+    scaled[1, 2] *= scale_h
     return scaled
 
 def read_all_view_pairs(pair_file_path):
@@ -173,8 +175,10 @@ def test_scan_with_fusion(model, scan_path, output_dir, device, max_views=10):
                 lines = f.readlines()
                 extrinsic = np.array([list(map(float, line.split())) for line in lines[1:5]])
                 intrinsic = np.array([list(map(float, line.split())) for line in lines[7:10]])
-                intrinsic[0, :] *= scale_w
-                intrinsic[1, :] *= scale_h
+                intrinsic[0, 0] *= scale_w
+                intrinsic[1, 1] *= scale_h
+                intrinsic[0, 2] *= scale_w
+                intrinsic[1, 2] *= scale_h
             
             # Convert to points
             img_path = os.path.join(scan_path, "images", f"{ref_idx:08d}.jpg")

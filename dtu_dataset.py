@@ -266,8 +266,10 @@ class DTUDataset(Dataset):
                     extrinsic = np.eye(4, dtype=np.float32)
             
             intrinsic = intrinsic.copy()
-            intrinsic[0, :] *= self._scale_w
-            intrinsic[1, :] *= self._scale_h
+            intrinsic[0, 0] *= self._scale_w
+            intrinsic[1, 1] *= self._scale_h
+            intrinsic[0, 2] *= self._scale_w
+            intrinsic[1, 2] *= self._scale_h
             intrinsics.append(torch.from_numpy(intrinsic))
             extrinsics.append(torch.from_numpy(extrinsic))
         

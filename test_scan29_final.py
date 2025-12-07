@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 import torch
+import open3d as o3d
 
 from mtmvsnet_model import MTMVSNet
 from eval_dtu import evaluate_point_cloud
@@ -24,6 +25,9 @@ MIN_CONSISTENT_VIEWS = 2        # how many source views must agree
 
 # Voxel size in *millimeters* for downsampling (1.0 ~ 1mm, smaller = denser)
 VOXEL_SIZE = 1.0
+
+# Depth scaling: network predictions are in meters, convert to millimeters
+DEPTH_SCALE_TO_MM = 1000.0
 
 MAX_VIEWS = 49
 DEPTH_MAX = 935.0  # millimeters
@@ -72,8 +76,10 @@ class ViewCache:
         # Scale intrinsics for resized image (1600x1200 → 640x512)
         scale_h = TARGET_HEIGHT / 1200.0
         scale_w = TARGET_WIDTH / 1600.0
-        intrinsic[0, :] *= scale_w
-        intrinsic[1, :] *= scale_h
+        intrinsic[0, 0] *= scale_w
+        intrinsic[1, 1] *= scale_h
+        intrinsic[0, 2] *= scale_w
+        intrinsic[1, 2] *= scale_h
 
         self.cache[view_idx] = {
             "image_tensor": image_tensor,
@@ -308,6 +314,21 @@ def voxel_downsample(
     return down_points.astype(np.float32), down_colors.astype(np.float32)
 
 
+def visualize_prediction_vs_ground_truth(pred_path: str, gt_path: str) -> None:
+    """Load and visualize predicted vs. ground-truth point clouds side-by-side."""
+    missing = [p for p in [pred_path, gt_path] if not (p and os.path.exists(p))]
+    if missing:
+        print(f"Skipping visualization because files are missing: {missing}")
+        return
+
+    print(f"Loading predicted point cloud: {pred_path}")
+    pcd_pred = o3d.io.read_point_cloud(pred_path)
+    print(f"Loading ground-truth point cloud: {gt_path}")
+    pcd_gt = o3d.io.read_point_cloud(gt_path)
+
+    o3d.visualization.draw_geometries([pcd_pred, pcd_gt], window_name="Pred vs GT")
+
+
 # -------------------------------------------------------------------------
 # Inference + fusion
 # -------------------------------------------------------------------------
@@ -347,7 +368,11 @@ def run_depth_estimation(
         prob_volume = outputs[-1][1][0].cpu()  # (D, H, W)
         confidence = torch.max(prob_volume, dim=0).values.numpy()  # (H, W)
 
-        depth_maps[ref_idx] = depth_map
+        # Convert predicted depth to millimeters and suppress low-confidence values
+        depth_map_mm = depth_map * DEPTH_SCALE_TO_MM
+        depth_map_mm = np.where(confidence >= CONFIDENCE_THRESHOLD, depth_map_mm, 0.0)
+
+        depth_maps[ref_idx] = depth_map_mm
         confidences[ref_idx] = confidence
 
     return depth_maps, confidences
@@ -518,6 +543,7 @@ def main() -> None:
     gt_candidates = [
         os.environ.get("DTU_GT_PLY"),
         os.path.join(scan_path, "stl029_gt_ascii_fixed.ply"),
+        os.path.join(scan_path, "scan29_clean.ply"),
         os.path.join(scan_path, "stl029_total.ply"),
     ]
     gt_path = next((p for p in gt_candidates if p and os.path.exists(p)), None)
@@ -556,6 +582,12 @@ def main() -> None:
         for line in log_entries:
             f.write(line + "\n")
     print(f"Saved log summary to {summary_path}")
+
+    # Optional Open3D visualization for qualitative alignment checks
+    if os.environ.get("OPEN3D_COMPARE", "0") == "1":
+        pred_vis = os.environ.get("PRED_PLY", os.path.join(os.getcwd(), "stl029_total.ply"))
+        gt_vis = os.environ.get("GT_PLY", os.path.join(os.getcwd(), "scan29_clean.ply"))
+        visualize_prediction_vs_ground_truth(pred_vis, gt_vis)
 
 
 if __name__ == "__main__":

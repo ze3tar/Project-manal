@@ -25,8 +25,10 @@ def _maybe_scale_intrinsic(intrinsic, target_size=(640, 512)):
     scale_w = target_width / ORIGINAL_WIDTH
     scale_h = target_height / ORIGINAL_HEIGHT
     scaled = intrinsic.copy()
-    scaled[0, :] *= scale_w
-    scaled[1, :] *= scale_h
+    scaled[0, 0] *= scale_w
+    scaled[1, 1] *= scale_h
+    scaled[0, 2] *= scale_w
+    scaled[1, 2] *= scale_h
     return scaled
 
 
