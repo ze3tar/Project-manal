@@ -47,6 +47,29 @@ python eval_dtu.py --pred outputs/scan29_clean.ply --gt scan29/scan29_gt.ply --o
 ```
 `eval_dtu.py` loads points, builds KD-trees in both directions, and reports Accuracy (reconstruction → GT), Completeness (GT → reconstruction), and their average.
 
+## Fruit-aware MT-MVSNet (MinneApple)
+The fruit segmentation head is trained separately from the depth backbone. The baseline MT-MVSNet weights remain unchanged and are reused for feature extraction only.
+
+### Train the fruit head
+```bash
+python train_fruit.py --data_root /path/to/MinneApple --checkpoint checkpoints/mtmvsnet_trained.pth
+```
+This saves segmentation head checkpoints under `checkpoints_fruit/`.
+
+### Evaluate the fruit head
+```bash
+python eval_fruit.py --data_root /path/to/MinneApple --checkpoint checkpoints_fruit/fruit_head_epoch_20.pth
+```
+
+### Combined inference (depth + fruit mask + fusion)
+```bash
+python inference_combined.py \
+  --scan_path /path/to/scan \
+  --checkpoint checkpoints/mtmvsnet_trained.pth \
+  --fruit_checkpoint checkpoints_fruit/fruit_head_epoch_20.pth
+```
+The script produces a fruit-labeled point cloud in both PLY and CSV formats under `outputs/`.
+
 ## Reproducibility checklist
 - All inference scripts seed Python, NumPy, and PyTorch RNGs for determinism, and log the depth range, valid/consistent pixels, and accepted points for every reference image.
 - Depth values are treated in meters across geometric computations, and translations are converted from millimeters to meters before fusion.
