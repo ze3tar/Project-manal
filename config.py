@@ -55,6 +55,17 @@ class TrainingConfig:
     
     # Resume training
     RESUME = None  # Set to checkpoint path to resume
+
+    # MinneApple fruit segmentation settings
+    MINNEAPPLE_ROOT = "/root/MinneApple"
+    FRUIT_EPOCHS = 20
+    FRUIT_BATCH_SIZE = 4
+    FRUIT_NUM_WORKERS = 2
+    FRUIT_LEARNING_RATE = 1e-4
+    FRUIT_LAMBDA_CE = 1.0
+    FRUIT_LAMBDA_DICE = 1.0
+    FRUIT_CHECKPOINT_DIR = "./checkpoints_fruit"
+    FRUIT_PRETRAINED = "./checkpoints/mtmvsnet_trained.pth"
     
     @classmethod
     def create_dirs(cls):
