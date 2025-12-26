@@ -17,6 +17,7 @@ def backproject_fruit_points(
     depth_scale: float = 1000.0,
     target_size: Tuple[int, int] = (640, 512),
 ):
+    """Back-project fruit pixels into world coordinates using meter-based depth."""
     depth_map = depth_map.astype(np.float32) * depth_scale
     fruit_mask = fruit_mask.astype(np.float32)
     h, w = depth_map.shape
@@ -58,7 +59,8 @@ def save_fruit_ply(path: str, points: np.ndarray, colors: np.ndarray, labels: np
         raise ValueError("No points to save")
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    colors_uint8 = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
+    colors_uint8 = np.zeros((points.shape[0], 3), dtype=np.uint8)
+    colors_uint8[:] = np.array([255, 0, 0], dtype=np.uint8)
     labels = labels.astype(np.int32)
 
     with open(path, "w", encoding="utf-8") as f:

@@ -1,4 +1,6 @@
 import argparse
+import os
+import time
 
 import torch
 from torch.utils.data import DataLoader
@@ -16,11 +18,14 @@ def compute_metrics(mask_pred: torch.Tensor, mask_gt: torch.Tensor):
     tp = (pred_binary * gt_binary).sum().item()
     fp = (pred_binary * (1 - gt_binary)).sum().item()
     fn = ((1 - pred_binary) * gt_binary).sum().item()
+    tn = ((1 - pred_binary) * (1 - gt_binary)).sum().item()
 
     precision = tp / (tp + fp + 1e-6)
     recall = tp / (tp + fn + 1e-6)
     iou = tp / (tp + fp + fn + 1e-6)
-    return precision, recall, iou
+    dice = (2 * tp) / (2 * tp + fp + fn + 1e-6)
+    pixel_acc = (tp + tn) / (tp + tn + fp + fn + 1e-6)
+    return precision, recall, iou, dice, pixel_acc, tp, tn, fp, fn
 
 
 def main():
@@ -28,6 +33,8 @@ def main():
     parser.add_argument("--data_root", default=TrainingConfig.MINNEAPPLE_ROOT)
     parser.add_argument("--checkpoint", required=True, help="Path to fruit head weights")
     parser.add_argument("--batch_size", type=int, default=TrainingConfig.FRUIT_BATCH_SIZE)
+    parser.add_argument("--metrics_path", default="outputs/fruit_eval_metrics.txt")
+    parser.add_argument("--extra_info_path", default="outputs/fruit_extra_info.txt")
     args = parser.parse_args()
 
     device = torch.device(TrainingConfig.DEVICE if torch.cuda.is_available() else "cpu")
@@ -56,23 +63,70 @@ def main():
     precision_sum = 0.0
     recall_sum = 0.0
     iou_sum = 0.0
+    dice_sum = 0.0
+    pixel_acc_sum = 0.0
+    tp_sum = 0.0
+    tn_sum = 0.0
+    fp_sum = 0.0
+    fn_sum = 0.0
 
+    start_time = time.time()
     with torch.no_grad():
         for batch in tqdm(loader, desc="Evaluating"):
             images = batch["image"].to(device).unsqueeze(1)
             masks = batch["mask"].to(device)
 
             outputs = model(images, compute_depth=False)
-            precision, recall, iou = compute_metrics(outputs["fruit_mask"], masks)
+            precision, recall, iou, dice, pixel_acc, tp, tn, fp, fn = compute_metrics(
+                outputs["fruit_mask"], masks
+            )
 
             precision_sum += precision
             recall_sum += recall
             iou_sum += iou
+            dice_sum += dice
+            pixel_acc_sum += pixel_acc
+            tp_sum += tp
+            tn_sum += tn
+            fp_sum += fp
+            fn_sum += fn
 
     num_batches = max(len(loader), 1)
-    print(f"Precision: {precision_sum / num_batches:.4f}")
-    print(f"Recall: {recall_sum / num_batches:.4f}")
-    print(f"IoU: {iou_sum / num_batches:.4f}")
+    avg_precision = precision_sum / num_batches
+    avg_recall = recall_sum / num_batches
+    avg_iou = iou_sum / num_batches
+    avg_dice = dice_sum / num_batches
+    avg_pixel_acc = pixel_acc_sum / num_batches
+
+    os.makedirs(os.path.dirname(args.metrics_path), exist_ok=True)
+    with open(args.metrics_path, "w", encoding="utf-8") as f:
+        f.write(f"IoU: {avg_iou:.4f}\n")
+        f.write(f"Dice: {avg_dice:.4f}\n")
+        f.write(f"Pixel Accuracy: {avg_pixel_acc:.4f}\n")
+        f.write(f"Precision: {avg_precision:.4f}\n")
+        f.write(f"Recall: {avg_recall:.4f}\n")
+        f.write(f"TP: {tp_sum:.0f}, TN: {tn_sum:.0f}, FP: {fp_sum:.0f}, FN: {fn_sum:.0f}\n")
+
+    elapsed = time.time() - start_time
+    total_images = len(dataset)
+    seconds_per_image = elapsed / max(total_images, 1)
+    params_count = sum(p.numel() for p in model.fruit_head.parameters())
+    max_memory_mb = 0.0
+    if torch.cuda.is_available():
+        max_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+    os.makedirs(os.path.dirname(args.extra_info_path), exist_ok=True)
+    if os.path.exists(args.extra_info_path):
+        with open(args.extra_info_path, "a", encoding="utf-8") as f:
+            f.write(f"Inference speed (seconds per image): {seconds_per_image:.4f}\n")
+    else:
+        with open(args.extra_info_path, "w", encoding="utf-8") as f:
+            f.write(f"Model parameters count: {params_count}\n")
+            f.write(f"Memory usage (MB): {max_memory_mb:.2f}\n")
+            f.write(f"Inference speed (seconds per image): {seconds_per_image:.4f}\n")
+
+    print(f"Metrics saved to {args.metrics_path}")
+    print(f"Extra info saved to {args.extra_info_path}")
 
 
 if __name__ == "__main__":

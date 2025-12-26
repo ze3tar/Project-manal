@@ -83,7 +83,7 @@ class MTMVSNetWithFruit(nn.Module):
         bsz, num_views, _, height, width = images.shape
         ref_final_features, src_final_features = self._extract_eaf_features(images)
 
-        fruit_logits = self.fruit_head(ref_final_features[0])
+        fruit_logits = self.fruit_head(ref_final_features[-1])
         fruit_mask = self.fruit_head.logits_to_mask(fruit_logits)
 
         depth_map = None

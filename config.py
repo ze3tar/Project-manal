@@ -66,7 +66,6 @@ class TrainingConfig:
     FRUIT_LAMBDA_DICE = 1.0
     FRUIT_CHECKPOINT_DIR = "./checkpoints_fruit"
     FRUIT_PRETRAINED = "./checkpoints/mtmvsnet_trained.pth"
-    USE_FRUIT_MODEL = False
     
     @classmethod
     def create_dirs(cls):

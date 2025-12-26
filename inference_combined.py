@@ -1,14 +1,35 @@
 import argparse
 import os
+from typing import Tuple
 
 import numpy as np
 import torch
+import cv2
 from tqdm import tqdm
 
 from config import TrainingConfig
 from fusion_with_fruit import backproject_fruit_points, fuse_fruit_views, save_fruit_csv, save_fruit_ply
 from mtmvsnet_with_fruit import MTMVSNetWithFruit
 from test_scan29_final import ViewCache, read_pair_file, prepare_batch
+
+
+def save_depth_png(depth_map: np.ndarray, path: str) -> None:
+    depth = depth_map.copy()
+    if depth.max() > 0:
+        depth = depth / depth.max()
+    depth_uint8 = np.clip(depth * 255.0, 0, 255).astype(np.uint8)
+    depth_color = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_TURBO)
+    cv2.imwrite(path, depth_color)
+
+
+def save_mask_png(mask: np.ndarray, path: str) -> None:
+    mask_uint8 = np.clip(mask * 255.0, 0, 255).astype(np.uint8)
+    cv2.imwrite(path, mask_uint8)
+
+
+def save_image_png(image_rgb: np.ndarray, path: str) -> None:
+    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(path, image_bgr)
 
 
 def main():
@@ -19,6 +40,8 @@ def main():
     parser.add_argument("--output_ply", default="outputs/fruit_labeled.ply")
     parser.add_argument("--output_csv", default="outputs/fruit_labeled.csv")
     parser.add_argument("--max_refs", type=int, default=None)
+    parser.add_argument("--save_examples_dir", default="outputs/fruit_examples")
+    parser.add_argument("--num_examples", type=int, default=20)
     args = parser.parse_args()
 
     device = torch.device(TrainingConfig.DEVICE if torch.cuda.is_available() else "cpu")
@@ -42,6 +65,8 @@ def main():
     points_list = []
     colors_list = []
     labels_list = []
+    examples_saved = 0
+    os.makedirs(args.save_examples_dir, exist_ok=True)
 
     with torch.no_grad():
         for idx, pair in enumerate(tqdm(pairs, desc="Processing views")):
@@ -78,6 +103,15 @@ def main():
                 points_list.append(points)
                 colors_list.append(colors)
                 labels_list.append(labels)
+
+            if examples_saved < args.num_examples:
+                image_path = os.path.join(args.save_examples_dir, f"image_{idx:04d}.png")
+                mask_path = os.path.join(args.save_examples_dir, f"mask_{idx:04d}.png")
+                depth_path = os.path.join(args.save_examples_dir, f"depth_{idx:04d}.png")
+                save_image_png(color_image, image_path)
+                save_mask_png(fruit_mask, mask_path)
+                save_depth_png(depth_map, depth_path)
+                examples_saved += 1
 
     fused_points, fused_colors, fused_labels = fuse_fruit_views(
         points_list, colors_list, labels_list, voxel_size=0.01
