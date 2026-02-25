@@ -10,7 +10,7 @@ from tqdm import tqdm
 from config import TrainingConfig
 from fusion_with_fruit import backproject_fruit_points, fuse_fruit_views, save_fruit_csv, save_fruit_ply
 from mtmvsnet_with_fruit import MTMVSNetWithFruit
-from test_scan29_final import ViewCache, read_pair_file, prepare_batch
+from test_scan29_final import ViewCache, read_pair_file, prepare_batch, detect_depth_units, apply_unit_settings
 
 
 def save_depth_png(depth_map: np.ndarray, path: str) -> None:
@@ -54,9 +54,15 @@ def main():
     backbone_state = torch.load(args.checkpoint, map_location=device)
     if isinstance(backbone_state, dict) and "state_dict" in backbone_state:
         backbone_state = backbone_state["state_dict"]
+    elif isinstance(backbone_state, dict) and "model" in backbone_state:
+        backbone_state = backbone_state["model"]
     model.backbone.load_state_dict(backbone_state, strict=False)
     model.fruit_head.load_state_dict(torch.load(args.fruit_checkpoint, map_location=device))
     model.eval()
+
+    # Auto-detect depth units and adjust global constants
+    units = detect_depth_units(args.scan_path)
+    apply_unit_settings(units)
 
     pair_path = os.path.join(args.scan_path, "pair.txt")
     pairs = read_pair_file(pair_path)
@@ -65,6 +71,7 @@ def main():
     points_list = []
     colors_list = []
     labels_list = []
+    confidences_list = []
     examples_saved = 0
     os.makedirs(args.save_examples_dir, exist_ok=True)
 
@@ -90,7 +97,7 @@ def main():
             intrinsic = view_data["intrinsic"]
             extrinsic = view_data["extrinsic_w2c"]
 
-            points, colors, labels = backproject_fruit_points(
+            points, colors, labels, confidences = backproject_fruit_points(
                 depth_map,
                 fruit_mask,
                 intrinsic,
@@ -103,6 +110,7 @@ def main():
                 points_list.append(points)
                 colors_list.append(colors)
                 labels_list.append(labels)
+                confidences_list.append(confidences)
 
             if examples_saved < args.num_examples:
                 image_path = os.path.join(args.save_examples_dir, f"image_{idx:04d}.png")
@@ -113,15 +121,16 @@ def main():
                 save_depth_png(depth_map, depth_path)
                 examples_saved += 1
 
-    fused_points, fused_colors, fused_labels = fuse_fruit_views(
-        points_list, colors_list, labels_list, voxel_size=0.01
+    fused_points, fused_colors, fused_labels, fused_confidences = fuse_fruit_views(
+        points_list, colors_list, labels_list,
+        confidences_list=confidences_list, voxel_size=0.01
     )
 
     if fused_points.shape[0] == 0:
         raise RuntimeError("No fruit points were fused; check masks or depth maps.")
 
-    save_fruit_ply(args.output_ply, fused_points, fused_colors, fused_labels)
-    save_fruit_csv(args.output_csv, fused_points, fused_colors, fused_labels)
+    save_fruit_ply(args.output_ply, fused_points, fused_colors, fused_labels, fused_confidences)
+    save_fruit_csv(args.output_csv, fused_points, fused_colors, fused_labels, fused_confidences)
     print(f"Saved fruit point cloud to {args.output_ply}")
     print(f"Saved fruit point CSV to {args.output_csv}")
 

@@ -54,13 +54,47 @@ class MinneAppleDataset(Dataset):
         return len(self.image_paths)
 
     def _augment(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        # Horizontal flip
         if random.random() < 0.5:
             image = cv2.flip(image, 1)
             mask = cv2.flip(mask, 1)
+        # Vertical flip
         if random.random() < 0.2:
             image = cv2.flip(image, 0)
             mask = cv2.flip(mask, 0)
+        # Random rotation (up to 15 degrees) — applied to both image and mask
+        if random.random() < 0.5:
+            angle = random.uniform(-15, 15)
+            h, w = image.shape[:2]
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+            image = cv2.warpAffine(image, M, (w, h), borderMode=cv2.BORDER_REFLECT_101)
+            mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT)
+        # Color jitter (image only)
+        if random.random() < 0.5:
+            image = self._color_jitter(image)
+        # Gaussian blur (image only)
+        if random.random() < 0.3:
+            ksize = random.choice([3, 5])
+            image = cv2.GaussianBlur(image, (ksize, ksize), 0)
         return image, mask
+
+    @staticmethod
+    def _color_jitter(image: np.ndarray) -> np.ndarray:
+        img = image.astype(np.float32)
+        # Brightness
+        img = img + random.uniform(-0.3, 0.3) * 255
+        # Contrast
+        img = img * random.uniform(0.7, 1.3)
+        img = np.clip(img, 0, 255)
+        # Saturation
+        hsv = cv2.cvtColor(img.astype(np.uint8), cv2.COLOR_BGR2HSV).astype(np.float32)
+        hsv[:, :, 1] = hsv[:, :, 1] * random.uniform(0.7, 1.3)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1], 0, 255)
+        # Hue
+        hsv[:, :, 0] = hsv[:, :, 0] + random.uniform(-18, 18)  # ~0.1 * 180
+        hsv[:, :, 0] = np.clip(hsv[:, :, 0], 0, 179)
+        img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        return img
 
     def __getitem__(self, idx: int):
         image_path = self.image_paths[idx]

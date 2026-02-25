@@ -11,28 +11,12 @@ from minneapple_dataset import MinneAppleDataset
 from mtmvsnet_with_fruit import MTMVSNetWithFruit
 
 
-def compute_metrics(mask_pred: torch.Tensor, mask_gt: torch.Tensor):
-    pred_binary = (mask_pred > 0.5).float()
-    gt_binary = mask_gt.float()
-
-    tp = (pred_binary * gt_binary).sum().item()
-    fp = (pred_binary * (1 - gt_binary)).sum().item()
-    fn = ((1 - pred_binary) * gt_binary).sum().item()
-    tn = ((1 - pred_binary) * (1 - gt_binary)).sum().item()
-
-    precision = tp / (tp + fp + 1e-6)
-    recall = tp / (tp + fn + 1e-6)
-    iou = tp / (tp + fp + fn + 1e-6)
-    dice = (2 * tp) / (2 * tp + fp + fn + 1e-6)
-    pixel_acc = (tp + tn) / (tp + tn + fp + fn + 1e-6)
-    return precision, recall, iou, dice, pixel_acc, tp, tn, fp, fn
-
-
 def main():
     parser = argparse.ArgumentParser(description="Evaluate fruit segmentation head")
     parser.add_argument("--data_root", default=TrainingConfig.MINNEAPPLE_ROOT)
     parser.add_argument("--checkpoint", required=True, help="Path to fruit head weights")
     parser.add_argument("--batch_size", type=int, default=TrainingConfig.FRUIT_BATCH_SIZE)
+    parser.add_argument("--split", default="val", help="Dataset split to evaluate (train/val/test)")
     parser.add_argument("--metrics_path", default="outputs/fruit_eval_metrics.txt")
     parser.add_argument("--extra_info_path", default="outputs/fruit_extra_info.txt")
     args = parser.parse_args()
@@ -41,7 +25,7 @@ def main():
 
     dataset = MinneAppleDataset(
         args.data_root,
-        split="val",
+        split=args.split,
         img_size=(TrainingConfig.IMG_WIDTH, TrainingConfig.IMG_HEIGHT),
         augment=False,
     )
@@ -60,11 +44,7 @@ def main():
     model.fruit_head.load_state_dict(torch.load(args.checkpoint, map_location=device))
     model.eval()
 
-    precision_sum = 0.0
-    recall_sum = 0.0
-    iou_sum = 0.0
-    dice_sum = 0.0
-    pixel_acc_sum = 0.0
+    # Bug 1 fix: accumulate global TP/FP/FN/TN instead of per-batch averages
     tp_sum = 0.0
     tn_sum = 0.0
     fp_sum = 0.0
@@ -73,38 +53,35 @@ def main():
     start_time = time.time()
     with torch.no_grad():
         for batch in tqdm(loader, desc="Evaluating"):
-            images = batch["image"].to(device).unsqueeze(1)
+            # Bug 2 fix: add .repeat() for NUM_VIEWS like training does
+            images = batch["image"].to(device).unsqueeze(1).repeat(
+                1, TrainingConfig.NUM_VIEWS, 1, 1, 1
+            )
             masks = batch["mask"].to(device)
 
             outputs = model(images, compute_depth=False)
-            precision, recall, iou, dice, pixel_acc, tp, tn, fp, fn = compute_metrics(
-                outputs["fruit_mask"], masks
-            )
+            pred_binary = (outputs["fruit_mask"] > 0.5).float()
+            gt_binary = masks.float()
 
-            precision_sum += precision
-            recall_sum += recall
-            iou_sum += iou
-            dice_sum += dice
-            pixel_acc_sum += pixel_acc
-            tp_sum += tp
-            tn_sum += tn
-            fp_sum += fp
-            fn_sum += fn
+            tp_sum += (pred_binary * gt_binary).sum().item()
+            fp_sum += (pred_binary * (1 - gt_binary)).sum().item()
+            fn_sum += ((1 - pred_binary) * gt_binary).sum().item()
+            tn_sum += ((1 - pred_binary) * (1 - gt_binary)).sum().item()
 
-    num_batches = max(len(loader), 1)
-    avg_precision = precision_sum / num_batches
-    avg_recall = recall_sum / num_batches
-    avg_iou = iou_sum / num_batches
-    avg_dice = dice_sum / num_batches
-    avg_pixel_acc = pixel_acc_sum / num_batches
+    # Compute final metrics from accumulated global totals
+    precision = tp_sum / (tp_sum + fp_sum + 1e-6)
+    recall = tp_sum / (tp_sum + fn_sum + 1e-6)
+    iou = tp_sum / (tp_sum + fp_sum + fn_sum + 1e-6)
+    dice = (2 * tp_sum) / (2 * tp_sum + fp_sum + fn_sum + 1e-6)
+    pixel_acc = (tp_sum + tn_sum) / (tp_sum + tn_sum + fp_sum + fn_sum + 1e-6)
 
     os.makedirs(os.path.dirname(args.metrics_path), exist_ok=True)
     with open(args.metrics_path, "w", encoding="utf-8") as f:
-        f.write(f"IoU: {avg_iou:.4f}\n")
-        f.write(f"Dice: {avg_dice:.4f}\n")
-        f.write(f"Pixel Accuracy: {avg_pixel_acc:.4f}\n")
-        f.write(f"Precision: {avg_precision:.4f}\n")
-        f.write(f"Recall: {avg_recall:.4f}\n")
+        f.write(f"IoU: {iou:.4f}\n")
+        f.write(f"Dice: {dice:.4f}\n")
+        f.write(f"Pixel Accuracy: {pixel_acc:.4f}\n")
+        f.write(f"Precision: {precision:.4f}\n")
+        f.write(f"Recall: {recall:.4f}\n")
         f.write(f"TP: {tp_sum:.0f}, TN: {tn_sum:.0f}, FP: {fp_sum:.0f}, FN: {fn_sum:.0f}\n")
 
     elapsed = time.time() - start_time

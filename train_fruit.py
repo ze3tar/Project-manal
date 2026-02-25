@@ -1,17 +1,29 @@
 import argparse
 import csv
 import os
+import random
 import time
 from typing import Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import TrainingConfig
-from losses_fruit import combined_fruit_loss, dice_loss
+from losses_fruit import combined_fruit_loss, dice_loss, multi_view_consistency_loss
 from minneapple_dataset import MinneAppleDataset
 from mtmvsnet_with_fruit import MTMVSNetWithFruit
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def load_checkpoint(path: str) -> dict:
@@ -39,19 +51,49 @@ def main():
     parser.add_argument("--lr", type=float, default=TrainingConfig.FRUIT_LEARNING_RATE)
     parser.add_argument("--lambda_ce", type=float, default=TrainingConfig.FRUIT_LAMBDA_CE)
     parser.add_argument("--lambda_dice", type=float, default=TrainingConfig.FRUIT_LAMBDA_DICE)
+    parser.add_argument("--lambda_consistency", type=float, default=0.5)
     parser.add_argument("--checkpoint", default=TrainingConfig.FRUIT_PRETRAINED)
     parser.add_argument("--output_dir", default=TrainingConfig.FRUIT_CHECKPOINT_DIR)
     parser.add_argument("--log_csv", default="outputs/fruit_training_metrics.csv")
     parser.add_argument("--extra_info_path", default="outputs/fruit_extra_info.txt")
+    parser.add_argument("--seed", type=int, default=42)
+    # Ablation flags (defaults from config)
+    parser.add_argument("--no_class_weights", action="store_true",
+                        default=not TrainingConfig.FRUIT_USE_CLASS_WEIGHTS)
+    parser.add_argument("--no_augmentation", action="store_true",
+                        default=not TrainingConfig.FRUIT_USE_AUGMENTATION)
+    parser.add_argument("--no_consistency", action="store_true",
+                        default=not TrainingConfig.FRUIT_USE_CONSISTENCY_LOSS)
+    parser.add_argument("--no_unfreeze", action="store_true",
+                        default=not TrainingConfig.FRUIT_USE_PROGRESSIVE_UNFREEZE)
+    parser.add_argument("--no_cosine_lr", action="store_true",
+                        default=not TrainingConfig.FRUIT_USE_COSINE_LR)
     args = parser.parse_args()
 
+    # Seed
+    set_seed(args.seed)
+
+    # Seed-specific output dir
+    args.output_dir = os.path.join(args.output_dir, f"seed_{args.seed}")
+
     device = torch.device(TrainingConfig.DEVICE if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"
+
+    use_augmentation = not args.no_augmentation
+    use_class_weights = not args.no_class_weights
+    use_consistency = not args.no_consistency
+    use_unfreeze = not args.no_unfreeze
+    use_cosine_lr = not args.no_cosine_lr
+
+    print(f"Ablation config: augment={use_augmentation} class_weights={use_class_weights} "
+          f"consistency={use_consistency} unfreeze={use_unfreeze} cosine_lr={use_cosine_lr} "
+          f"seed={args.seed}")
 
     dataset = MinneAppleDataset(
         args.data_root,
         split="train",
         img_size=(TrainingConfig.IMG_WIDTH, TrainingConfig.IMG_HEIGHT),
-        augment=True,
+        augment=use_augmentation,
     )
     loader = DataLoader(
         dataset,
@@ -59,6 +101,7 @@ def main():
         shuffle=True,
         num_workers=TrainingConfig.FRUIT_NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=TrainingConfig.FRUIT_NUM_WORKERS > 0,
     )
     val_dataset = MinneAppleDataset(
         args.data_root,
@@ -72,6 +115,7 @@ def main():
         shuffle=False,
         num_workers=TrainingConfig.FRUIT_NUM_WORKERS,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=TrainingConfig.FRUIT_NUM_WORKERS > 0,
     )
 
     model = MTMVSNetWithFruit(
@@ -88,6 +132,11 @@ def main():
         param.requires_grad = False
 
     optimizer = torch.optim.Adam(model.fruit_head.parameters(), lr=args.lr)
+    if use_cosine_lr:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    else:
+        scheduler = None
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.dirname(args.log_csv), exist_ok=True)
@@ -95,13 +144,27 @@ def main():
 
     with open(args.log_csv, "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["epoch", "train_loss", "val_loss", "iou", "dice"])
+        writer.writerow(["seed", "epoch", "train_loss", "val_loss", "iou", "dice"])
 
     start_time = time.time()
     best_val_loss = float("inf")
     best_epoch = 0
+    backbone_unfrozen = False
 
     for epoch in range(1, args.epochs + 1):
+        # Progressive unfreezing at epoch 6
+        if use_unfreeze and epoch == 6 and not backbone_unfrozen:
+            unfrozen_params = []
+            for module in [model.backbone.eaf,
+                           model.backbone.mtb_blocks[2],
+                           model.backbone.mtb_blocks[3]]:
+                for param in module.parameters():
+                    param.requires_grad = True
+                    unfrozen_params.append(param)
+            optimizer.add_param_group({"params": unfrozen_params, "lr": args.lr * 0.1})
+            backbone_unfrozen = True
+            print(f"Epoch {epoch}: Unfroze EAF + MTB blocks 2,3 with LR={args.lr * 0.1:.1e}")
+
         model.train()
         running_loss = 0.0
         running_acc = 0.0
@@ -113,18 +176,28 @@ def main():
 
             images = images.unsqueeze(1).repeat(1, TrainingConfig.NUM_VIEWS, 1, 1, 1)
 
-            outputs = model(images, compute_depth=False)
-            logits = outputs["fruit_logits"]
-            loss = combined_fruit_loss(logits, masks, args.lambda_ce, args.lambda_dice)
-
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                outputs = model(images, compute_depth=False, multi_view_fruit=use_consistency)
+                logits = outputs["fruit_logits"]
+                loss = combined_fruit_loss(logits, masks, args.lambda_ce, args.lambda_dice,
+                                           use_class_weights=use_class_weights)
+
+                if use_consistency and outputs["all_view_fruit_logits"] is not None:
+                    cons_loss = multi_view_consistency_loss(outputs["all_view_fruit_logits"])
+                    loss = loss + args.lambda_consistency * cons_loss
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += loss.item()
             acc, iou = compute_metrics(outputs["fruit_mask"].detach(), masks)
             running_acc += acc
             running_iou += iou
+
+        if scheduler is not None:
+            scheduler.step()
 
         num_batches = max(len(loader), 1)
         avg_loss = running_loss / num_batches
@@ -141,9 +214,11 @@ def main():
                     1, TrainingConfig.NUM_VIEWS, 1, 1, 1
                 )
                 masks = batch["mask"].to(device)
-                outputs = model(images, compute_depth=False)
-                logits = outputs["fruit_logits"]
-                loss = combined_fruit_loss(logits, masks, args.lambda_ce, args.lambda_dice)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    outputs = model(images, compute_depth=False)
+                    logits = outputs["fruit_logits"]
+                    loss = combined_fruit_loss(logits, masks, args.lambda_ce, args.lambda_dice,
+                                               use_class_weights=use_class_weights)
                 val_loss += loss.item()
                 val_dice += (1.0 - dice_loss(logits, masks)).item()
                 _, iou = compute_metrics(outputs["fruit_mask"], masks)
@@ -165,11 +240,14 @@ def main():
 
         with open(args.log_csv, "a", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow([epoch, avg_loss, avg_val_loss, avg_val_iou, avg_val_dice])
+            writer.writerow([args.seed, epoch, avg_loss, avg_val_loss, avg_val_iou, avg_val_dice])
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             best_epoch = epoch
+            best_path = os.path.join(args.output_dir, "fruit_head_best.pth")
+            torch.save(model.fruit_head.state_dict(), best_path)
+            print(f"New best model saved to {best_path} (val_loss={best_val_loss:.4f})")
 
     total_time = time.time() - start_time
     total_minutes = total_time / 60.0
@@ -180,6 +258,7 @@ def main():
         max_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
 
     with open(args.extra_info_path, "w", encoding="utf-8") as f:
+        f.write(f"Seed: {args.seed}\n")
         f.write(f"Best epoch number: {best_epoch}\n")
         f.write(f"Total training time (hours): {total_hours:.2f}\n")
         f.write(f"Total training time (minutes): {total_minutes:.2f}\n")

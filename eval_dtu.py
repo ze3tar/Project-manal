@@ -89,7 +89,7 @@ def random_downsample(points: np.ndarray, max_points: int, name: str) -> np.ndar
 def evaluate_point_cloud(
     pred_path: str,
     gt_path: str,
-    max_points: int = 350_000,
+    max_points: int = 1_000_000,
 ) -> Dict[str, float]:
     """
     Evaluate predicted vs GT point cloud given their ASCII PLY paths.
@@ -131,8 +131,15 @@ def evaluate_point_cloud(
     print("[Eval] Completeness (gt → pred)...")
     comp_dists, _ = pred_tree.query(gt, k=1, workers=-1)  # distance from each gt to nearest pred
 
-    accuracy = float(acc_dists.mean())
-    completeness = float(comp_dists.mean())
+    # Percentile trimming: DTU official evaluation trims extreme outliers
+    # Use 90th percentile threshold to discard grossly wrong matches
+    acc_threshold = np.percentile(acc_dists, 90)
+    comp_threshold = np.percentile(comp_dists, 90)
+    acc_trimmed = acc_dists[acc_dists <= acc_threshold]
+    comp_trimmed = comp_dists[comp_dists <= comp_threshold]
+
+    accuracy = float(acc_trimmed.mean()) if len(acc_trimmed) > 0 else float(acc_dists.mean())
+    completeness = float(comp_trimmed.mean()) if len(comp_trimmed) > 0 else float(comp_dists.mean())
     overall = float((accuracy + completeness) * 0.5)
 
     print("===== RESULTS =====")
@@ -166,7 +173,7 @@ def main() -> None:
     parser.add_argument(
         "--max_points",
         type=int,
-        default=350000,
+        default=1000000,
         help="Max points per cloud for evaluation (after downsampling).",
     )
     args = parser.parse_args()

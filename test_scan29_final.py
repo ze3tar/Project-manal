@@ -18,20 +18,100 @@ from eval_dtu import evaluate_point_cloud
 TARGET_HEIGHT = 512
 TARGET_WIDTH = 640
 
-# Photometric + geometric filtering
-CONFIDENCE_THRESHOLD = 0.2      # probability threshold
-GEOMETRIC_REL_ERROR = 0.03      # relative depth error tolerance
-MIN_CONSISTENT_VIEWS = 2        # how many source views must agree
+# Photometric + geometric filtering (tightened per CasMVSNet/CVP-MVSNet best practices)
+CONFIDENCE_THRESHOLD = 0.03      # just above uniform baseline (1/48=0.021) for stage 0
+GEOMETRIC_REL_ERROR = 0.05      # 5%: tight enough for accuracy, lenient enough for coarse stage 0
+MIN_CONSISTENT_VIEWS = 2        # require 2 views to agree — filters noise without being too strict
 
-# Voxel size in *millimeters* for downsampling (1.0 ~ 1mm, smaller = denser)
-VOXEL_SIZE = 1.0
+# Voxel size for downsampling (adjusted automatically per unit system)
+VOXEL_SIZE = 1.5  # sub-mm accuracy requires finer voxels (was 1.0)
 
-# Depth scaling: network predictions are in meters, convert to millimeters
-DEPTH_SCALE_TO_MM = 1000.0
+# Depth scaling: network predictions match the camera-file depth units.
+DEPTH_SCALE_TO_MM = 1.0
 
 MAX_VIEWS = 49
-DEPTH_MAX = 935.0  # millimeters
+DEPTH_MAX = 935.0  # default mm; overridden for meter-based scans
 LOG_DIR = os.path.join("outputs", "logs")
+
+
+def median_filter_depth(depth_map: np.ndarray, kernel_size: int = 5) -> np.ndarray:
+    """Apply median filter to depth map to remove spike noise while preserving edges."""
+    from scipy.ndimage import median_filter
+    valid = depth_map > 0
+    filtered = median_filter(depth_map, size=kernel_size)
+    # Only apply where valid, preserve zeros
+    result = np.where(valid, filtered, 0.0)
+    return result
+
+
+def bilateral_filter_depth(depth_map: np.ndarray, sigma_spatial: int = 7, sigma_depth: float = 2.0) -> np.ndarray:
+    """Apply bilateral filter to depth map — smooths while preserving edges."""
+    valid = depth_map > 0
+    if not np.any(valid):
+        return depth_map
+    # Normalize depth to 0-255 range for cv2.bilateralFilter
+    d_min = depth_map[valid].min()
+    d_max = depth_map[valid].max()
+    if d_max - d_min < 1e-6:
+        return depth_map
+    normalized = ((depth_map - d_min) / (d_max - d_min) * 255).astype(np.float32)
+    normalized[~valid] = 0
+    filtered = cv2.bilateralFilter(normalized, d=-1, sigmaColor=sigma_depth * 255 / (d_max - d_min),
+                                    sigmaSpace=sigma_spatial)
+    # Map back to original depth range
+    result = filtered / 255.0 * (d_max - d_min) + d_min
+    result[~valid] = 0.0
+    return result
+
+
+def statistical_outlier_removal(
+    points: np.ndarray, colors: np.ndarray, nb_neighbors: int = 20, std_ratio: float = 2.0
+) -> tuple:
+    """Remove statistical outliers from point cloud (like Open3D SOR)."""
+    if len(points) < nb_neighbors + 1:
+        return points, colors
+    from scipy.spatial import cKDTree
+    tree = cKDTree(points)
+    dists, _ = tree.query(points, k=nb_neighbors + 1)
+    # Exclude self-distance (column 0)
+    mean_dists = dists[:, 1:].mean(axis=1)
+    global_mean = mean_dists.mean()
+    global_std = mean_dists.std()
+    threshold = global_mean + std_ratio * global_std
+    mask = mean_dists < threshold
+    return points[mask], colors[mask]
+
+
+def detect_depth_units(scan_path: str) -> str:
+    """Auto-detect whether a scan uses meters or millimeters.
+
+    Reads the first camera file and checks depth_min.
+    If depth_min < 10 the data is almost certainly in meters.
+    Returns 'meters' or 'millimeters'.
+    """
+    cams_dir = os.path.join(scan_path, "cams")
+    cam_files = sorted(f for f in os.listdir(cams_dir) if f.endswith("_cam.txt"))
+    if not cam_files:
+        return "millimeters"
+    with open(os.path.join(cams_dir, cam_files[0])) as f:
+        lines = f.readlines()
+    depth_min = float(lines[11].split()[0])
+    return "meters" if depth_min < 10 else "millimeters"
+
+
+def apply_unit_settings(units: str) -> None:
+    """Adjust global constants based on the detected unit system."""
+    global VOXEL_SIZE, DEPTH_MAX, DEPTH_SCALE_TO_MM
+    if units == "meters":
+        VOXEL_SIZE = 0.001   # 1 mm in meters
+        DEPTH_MAX = 20.0     # 20 m max depth (generous for outdoor)
+        DEPTH_SCALE_TO_MM = 1.0  # keep native units, no conversion
+        print("[Units] Detected METERS – VOXEL_SIZE=0.001, DEPTH_MAX=20.0")
+    else:
+        VOXEL_SIZE = 1.0
+        DEPTH_MAX = 935.0
+        DEPTH_SCALE_TO_MM = 1.0
+        print("[Units] Detected MILLIMETERS – VOXEL_SIZE=1.0, DEPTH_MAX=935.0")
 
 
 # -------------------------------------------------------------------------
@@ -54,6 +134,9 @@ class ViewCache:
         image_bgr = cv2.imread(img_path)
         if image_bgr is None:
             raise FileNotFoundError(f"Missing image: {img_path}")
+
+        # Read actual image dimensions before resize (handles any resolution)
+        orig_h, orig_w = image_bgr.shape[:2]
         image_bgr = cv2.resize(image_bgr, (TARGET_WIDTH, TARGET_HEIGHT))
         image_tensor = torch.from_numpy(image_bgr).permute(2, 0, 1).float() / 255.0
         color_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -73,9 +156,9 @@ class ViewCache:
         depth_min = float(depth_line[0])
         depth_interval = float(depth_line[1])
 
-        # Scale intrinsics for resized image (1600x1200 → 640x512)
-        scale_h = TARGET_HEIGHT / 1200.0
-        scale_w = TARGET_WIDTH / 1600.0
+        # Scale intrinsics dynamically based on actual image dimensions
+        scale_h = TARGET_HEIGHT / float(orig_h)
+        scale_w = TARGET_WIDTH / float(orig_w)
         intrinsic[0, 0] *= scale_w
         intrinsic[1, 1] *= scale_h
         intrinsic[0, 2] *= scale_w
@@ -245,7 +328,26 @@ def geometric_consistency_mask(
         relative_error = np.abs(sampled_depths - cam_depths) / np.maximum(
             cam_depths, 1e-6
         )
-        agreeing = relative_error <= GEOMETRIC_REL_ERROR
+        depth_ok = relative_error <= GEOMETRIC_REL_ERROR
+
+        # Round-trip reprojection check: project source point back to reference
+        # and verify pixel displacement < 1 pixel
+        u_src = u[candidate_idx]
+        v_src = v[candidate_idx]
+        src_pixels = np.stack([u_src, v_src, np.ones_like(u_src)], axis=0)  # [3, N']
+        src_cam_coords = np.linalg.inv(intr_src) @ src_pixels * sampled_depths  # [3, N']
+        src_cam_h = np.vstack([src_cam_coords, np.ones((1, src_cam_coords.shape[1]))])
+        # source camera → world → ref camera
+        world_from_src = np.linalg.inv(extr_src_w2c) @ src_cam_h
+        ref_cam_reproj = ref_extrinsic_w2c @ world_from_src  # [4, N']
+        z_reproj = ref_cam_reproj[2]
+        ref_proj = ref_intrinsic @ (ref_cam_reproj[:3] / np.maximum(z_reproj, 1e-6))
+        u_reproj = ref_proj[0]
+        v_reproj = ref_proj[1]
+        pixel_diff_sq = (u_reproj - xs[candidate_idx])**2 + (v_reproj - ys[candidate_idx])**2
+        pixel_ok = pixel_diff_sq < 1.0  # < 1 pixel displacement
+
+        agreeing = depth_ok & pixel_ok
         counts[candidate_idx[agreeing]] += 1
 
     mask_flat = np.zeros(h * w, dtype=bool)
@@ -363,14 +465,19 @@ def run_depth_estimation(
 
         with torch.no_grad():
             outputs = model(images, intrinsics, extrinsics, depth_values)
-        # We assume final stage is outputs[-1], with (depth, prob_volume)
-        depth_map = outputs[-1][0][0].cpu().numpy()
-        prob_volume = outputs[-1][1][0].cpu()  # (D, H, W)
+        # Stage 0 is healthiest (std=0.241); later stages collapsed during training.
+        # Use stage 0 depth + prob for more reliable predictions.
+        depth_map = outputs[0][0][0].cpu().numpy()
+        prob_volume = outputs[0][1][0].cpu()  # (D, H, W)
         confidence = torch.max(prob_volume, dim=0).values.numpy()  # (H, W)
 
         # Convert predicted depth to millimeters and suppress low-confidence values
         depth_map_mm = depth_map * DEPTH_SCALE_TO_MM
         depth_map_mm = np.where(confidence >= CONFIDENCE_THRESHOLD, depth_map_mm, 0.0)
+
+        # Median filter to remove spike noise, then bilateral to smooth while preserving edges
+        depth_map_mm = median_filter_depth(depth_map_mm, kernel_size=5)
+        depth_map_mm = bilateral_filter_depth(depth_map_mm, sigma_spatial=7, sigma_depth=2.0)
 
         depth_maps[ref_idx] = depth_map_mm
         confidences[ref_idx] = confidence
@@ -477,7 +584,13 @@ def fuse_points(
 
     # Voxel downsampling for efficiency
     down_points, down_colors = voxel_downsample(all_points, all_colors, VOXEL_SIZE)
-    return down_points, down_colors
+
+    # Statistical outlier removal to clean stray points
+    clean_points, clean_colors = statistical_outlier_removal(
+        down_points, down_colors, nb_neighbors=20, std_ratio=2.0
+    )
+    print(f"[SOR] {len(down_points)} → {len(clean_points)} points after outlier removal")
+    return clean_points, clean_colors
 
 
 def save_ply(path: str, points: np.ndarray, colors: np.ndarray) -> None:
@@ -510,13 +623,23 @@ def main() -> None:
     scan_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan29")
     pair_path = os.path.join(scan_path, "pair.txt")
 
+    # Auto-detect depth units and adjust constants
+    units = detect_depth_units(scan_path)
+    apply_unit_settings(units)
+
     # Load model
     model = MTMVSNet(base_channels=32, num_stages=4).to(device)
-    ckpt_path = os.path.join("checkpoints", "mtmvsnet_trained.pth")
+    ckpt_path = os.path.join("checkpoints", "mtmvsnet_best.pth")
     print(f"Loading checkpoint: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
+
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        print("Loading model weights from checkpoint['model']")
+        model.load_state_dict(checkpoint['model'])
+    else:
+        print("Loading raw state_dict")
+        model.load_state_dict(checkpoint)
     # training script saved plain state_dict
-    model.load_state_dict(checkpoint)
     model.eval()
 
     cache = ViewCache(scan_path)

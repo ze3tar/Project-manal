@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Checkpoints
+checkpoints/
+
+# Outputs
+outputs/
+
+# Other .md files (keep only README.md)
+PROJECT_CONTRIBUTIONS.md
+PROJECT_PRESENTATION.md
+THESIS_CORRECTIONS.md
+TRAINING_GUIDE.md
+email_dorigoni_draft.md
+
+# Personal/temp files
+man.png
+*.png
+*.docx
+stl029_total.ply
+
+# Dataset cache
+scan29/

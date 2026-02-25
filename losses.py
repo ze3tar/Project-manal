@@ -17,10 +17,22 @@ def focal_loss_with_prob_volume(prob_volume, depth_gt, depth_values, mask, gamma
     """
     B, D, H, W = prob_volume.shape
     
+    # Resize depth_gt and mask to match prob_volume resolution if needed
+    if depth_gt.shape[-2:] != (H, W):
+        depth_gt = F.interpolate(
+            depth_gt.unsqueeze(1), size=(H, W), mode='nearest'
+        ).squeeze(1)
+        mask = F.interpolate(
+            mask.unsqueeze(1).float(), size=(H, W), mode='nearest'
+        ).squeeze(1)
+
     # Find nearest depth index for each pixel
     depth_gt_expanded = depth_gt.unsqueeze(1)  # [B, 1, H, W]
-    depth_values_expanded = depth_values.view(B, -1, 1, 1)  # [B, D, 1, 1]
-    
+    if depth_values.ndim == 2:
+        depth_values_expanded = depth_values.view(B, -1, 1, 1)  # [B, D, 1, 1]
+    else:
+        depth_values_expanded = depth_values  # already [B, D, H, W]
+
     # Calculate distance to each depth hypothesis
     depth_diff = torch.abs(depth_values_expanded - depth_gt_expanded)
     gt_index = depth_diff.argmin(dim=1)  # [B, H, W]
@@ -46,12 +58,12 @@ def focal_loss_with_prob_volume(prob_volume, depth_gt, depth_values, mask, gamma
 
 
 def l1_depth_loss(pred_depth, gt_depth, mask):
-    """L1 depth loss (backup/alternative)"""
+    """Smooth L1 depth loss — less sensitive to outliers than raw L1."""
     if pred_depth.dim() == 3: pred_depth = pred_depth.unsqueeze(1)
     if gt_depth.dim() == 3:   gt_depth   = gt_depth.unsqueeze(1)
     if mask.dim() == 3:       mask       = mask.unsqueeze(1)
     denom = mask.sum().clamp_min(1.0)
-    return (F.l1_loss(pred_depth * mask, gt_depth * mask, reduction='sum') / denom)
+    return (F.smooth_l1_loss(pred_depth * mask, gt_depth * mask, reduction='sum', beta=1.0) / denom)
 
 
 def cosine_normal_loss(pred_normals, gt_normals, mask, eps=1e-6):

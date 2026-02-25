@@ -58,33 +58,60 @@ class MTMVSNetWithFruit(nn.Module):
             ref_feat = ref_final_features[scale_idx]
             src_feat_list = [src_view[scale_idx] for src_view in src_final_features] if src_final_features else []
 
-            depth_map, prob_volume, depth_vals = self.backbone.mbps._process_single_stage(
-                ref_feat, src_feat_list, intrinsics, extrinsics, current_depth_values, stage_idx
+            depth_map_feat, prob_volume, depth_vals = self.backbone.mbps._process_single_stage(
+                ref_feat, src_feat_list, intrinsics, extrinsics, current_depth_values, stage_idx,
+                image_shape=(height, width)
             )
 
-            if depth_map.shape[-2:] != (height, width):
-                depth_map = F.interpolate(
-                    depth_map.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False
+            # Upsample to full res for output only
+            depth_map_full = depth_map_feat
+            prob_volume_full = prob_volume
+            if depth_map_feat.shape[-2:] != (height, width):
+                depth_map_full = F.interpolate(
+                    depth_map_feat.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=True
                 ).squeeze(1)
-                prob_volume = F.interpolate(
-                    prob_volume, size=(height, width), mode="bilinear", align_corners=False
+                prob_volume_full = F.interpolate(
+                    prob_volume, size=(height, width), mode="bilinear", align_corners=True
                 )
 
-            results.append((depth_map, prob_volume, depth_vals))
+            results.append((depth_map_full, prob_volume_full, depth_vals))
 
+            # Cascade: use feature-resolution depth for per-pixel hypotheses
             if stage_idx < self.backbone.num_stages - 1:
+                next_scale = stage_to_scale[stage_idx + 1]
+                next_size = ref_final_features[next_scale].shape[-2:]
                 current_depth_values = self.backbone.mbps._update_depth_values(
-                    depth_map, current_depth_values, stage_idx
+                    depth_map_feat, current_depth_values, stage_idx,
+                    next_feat_size=next_size
                 )
 
         return results
 
-    def forward(self, images, intrinsics=None, extrinsics=None, depth_values=None, compute_depth=True):
+    def forward(self, images, intrinsics=None, extrinsics=None, depth_values=None,
+                compute_depth=True, multi_view_fruit=False):
         bsz, num_views, _, height, width = images.shape
         ref_final_features, src_final_features = self._extract_eaf_features(images)
 
         fruit_logits = self.fruit_head(ref_final_features[-1])
+        # Upsample fruit logits to input resolution (features are at 1/8 scale)
+        if fruit_logits.shape[-2:] != (height, width):
+            fruit_logits = F.interpolate(
+                fruit_logits, size=(height, width), mode="bilinear", align_corners=False
+            )
         fruit_mask = self.fruit_head.logits_to_mask(fruit_logits)
+
+        # Multi-view fruit: run EAF + fruit_head on source views too
+        all_view_fruit_logits = None
+        if multi_view_fruit and not compute_depth:
+            all_view_fruit_logits = [fruit_logits]
+            for src_feats in src_final_features:
+                src_eaf_feats = self.backbone.eaf(src_feats)
+                src_logits = self.fruit_head(src_eaf_feats[-1])
+                if src_logits.shape[-2:] != (height, width):
+                    src_logits = F.interpolate(
+                        src_logits, size=(height, width), mode="bilinear", align_corners=False
+                    )
+                all_view_fruit_logits.append(src_logits)
 
         depth_map = None
         prob_volume = None
@@ -107,4 +134,5 @@ class MTMVSNetWithFruit(nn.Module):
             "prob": prob_volume,
             "fruit_mask": fruit_mask,
             "fruit_logits": fruit_logits,
+            "all_view_fruit_logits": all_view_fruit_logits,
         }

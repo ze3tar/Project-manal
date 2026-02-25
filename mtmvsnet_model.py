@@ -1,4 +1,4 @@
-# mtmvsnet_model.py - Pass through 3-tuple
+# mtmvsnet_model.py - Cascade-aware forward with per-pixel depth refinement
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -55,7 +55,7 @@ class MTMVSNet(nn.Module):
             )
             ref_enhanced.append(ref_feat_enhanced)
         enhanced_features.append(ref_enhanced)
-        
+
         for view_idx in range(1, N):
             view_enhanced = []
             for scale_idx in range(4):
@@ -83,25 +83,33 @@ class MTMVSNet(nn.Module):
             src_feat_list = [src_view[scale_idx] for src_view in src_final_features] if src_final_features else []
 
             try:
-                depth_map, prob_volume, depth_vals = self.mbps._process_single_stage(
-                    ref_feat, src_feat_list, intrinsics, extrinsics, current_depth_values, stage_idx
+                depth_map_feat, prob_volume, depth_vals = self.mbps._process_single_stage(
+                    ref_feat, src_feat_list, intrinsics, extrinsics, current_depth_values, stage_idx,
+                    image_shape=(H, W)
                 )
-                
-                if depth_map.shape[-2:] != (H, W):
-                    depth_map = F.interpolate(
-                        depth_map.unsqueeze(1), size=(H, W), 
-                        mode='bilinear', align_corners=False
+
+                # Upsample to full res for output/loss only
+                depth_map_full = depth_map_feat
+                prob_volume_full = prob_volume
+                if depth_map_feat.shape[-2:] != (H, W):
+                    depth_map_full = F.interpolate(
+                        depth_map_feat.unsqueeze(1), size=(H, W),
+                        mode='bilinear', align_corners=True
                     ).squeeze(1)
-                    prob_volume = F.interpolate(
+                    prob_volume_full = F.interpolate(
                         prob_volume, size=(H, W),
-                        mode='bilinear', align_corners=False
+                        mode='bilinear', align_corners=True
                     )
-                
-                results.append((depth_map, prob_volume, depth_vals))
-                
+
+                results.append((depth_map_full, prob_volume_full, depth_vals))
+
+                # Cascade: use feature-resolution depth for per-pixel hypotheses
                 if stage_idx < self.num_stages - 1:
+                    next_scale = stage_to_scale[stage_idx + 1]
+                    next_size = ref_final_features[next_scale].shape[-2:]
                     current_depth_values = self.mbps._update_depth_values(
-                        depth_map, current_depth_values, stage_idx
+                        depth_map_feat, current_depth_values, stage_idx,
+                        next_feat_size=next_size
                     )
             except Exception as e:
                 print(f"Stage {stage_idx} failed: {e}")
@@ -111,9 +119,3 @@ class MTMVSNet(nn.Module):
                 results.append((fallback_depth, fallback_prob, current_depth_values))
 
         return results
-
-
-
-
-
-

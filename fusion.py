@@ -12,9 +12,13 @@ ORIGINAL_WIDTH = 1600
 ORIGINAL_HEIGHT = 1200
 
 
-def _maybe_scale_intrinsic(intrinsic, target_size=(640, 512)):
-    """Scale intrinsic matrix if it still corresponds to the original DTU size."""
+def _maybe_scale_intrinsic(intrinsic, target_size=(640, 512), original_size=None):
+    """Scale intrinsic matrix if it still corresponds to the original image size.
 
+    If ``original_size`` is not provided, the function falls back to the
+    DTU default (1600x1200).  When the principal point already fits within
+    ``target_size`` the intrinsic is returned unchanged.
+    """
     if intrinsic is None:
         return None
 
@@ -22,8 +26,13 @@ def _maybe_scale_intrinsic(intrinsic, target_size=(640, 512)):
     if intrinsic[0, 2] <= target_width and intrinsic[1, 2] <= target_height:
         return intrinsic
 
-    scale_w = target_width / ORIGINAL_WIDTH
-    scale_h = target_height / ORIGINAL_HEIGHT
+    if original_size is not None:
+        orig_w, orig_h = original_size
+    else:
+        orig_w, orig_h = ORIGINAL_WIDTH, ORIGINAL_HEIGHT
+
+    scale_w = target_width / orig_w
+    scale_h = target_height / orig_h
     scaled = intrinsic.copy()
     scaled[0, 0] *= scale_w
     scaled[1, 1] *= scale_h

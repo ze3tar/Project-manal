@@ -78,11 +78,17 @@ class CostRegularization3DUNet(nn.Module):
         Returns:
             prob: [B, D, H, W]
         """
-        # Encoder
-        conv0 = self.conv0(x)
-        conv1 = self.conv1(conv0)
-        conv2 = self.conv2(conv1)
-        conv3 = self.conv3(conv2)
+        # Encoder (with gradient checkpointing to save memory)
+        if self.training and x.requires_grad:
+            conv0 = torch.utils.checkpoint.checkpoint(self.conv0, x, use_reentrant=False)
+            conv1 = torch.utils.checkpoint.checkpoint(self.conv1, conv0, use_reentrant=False)
+            conv2 = torch.utils.checkpoint.checkpoint(self.conv2, conv1, use_reentrant=False)
+            conv3 = torch.utils.checkpoint.checkpoint(self.conv3, conv2, use_reentrant=False)
+        else:
+            conv0 = self.conv0(x)
+            conv1 = self.conv1(conv0)
+            conv2 = self.conv2(conv1)
+            conv3 = self.conv3(conv2)
         
         # Decoder with adaptive skip connections
         deconv3 = self.deconv3(conv3)

@@ -14,18 +14,23 @@ class DTUDataset(Dataset):
     for training the MT-MVSNet model.
     """
     
-    def __init__(self, root_dir, num_views=5, img_height=512, img_width=640):
+    def __init__(self, root_dir, num_views=5, img_height=512, img_width=640,
+                 num_depths=48, augment=True):
         """
         Args:
             root_dir: Path to 'mvs_training/dtu/' folder
             num_views: Number of views to use for training (reference + source views)
             img_height: Target image height
             img_width: Target image width
+            num_depths: Number of depth hypotheses for stage 0
+            augment: Whether to apply color augmentation
         """
         self.root_dir = root_dir
         self.num_views = num_views
         self.img_height = img_height
         self.img_width = img_width
+        self.num_depths = num_depths
+        self.augment = augment
         self._scale_w = self.img_width / 1600.0
         self._scale_h = self.img_height / 1200.0
         
@@ -141,6 +146,15 @@ class DTUDataset(Dataset):
             images.append(img)
         
         images = torch.stack(images)  # [N, 3, H, W]
+
+        # Color augmentation: apply same jitter to all views for consistency
+        if self.augment:
+            brightness = np.random.uniform(0.8, 1.2)
+            contrast = np.random.uniform(0.8, 1.2)
+            images = images * brightness
+            mean = images.mean(dim=(2, 3), keepdim=True)
+            images = (images - mean) * contrast + mean
+            images = images.clamp(0.0, 1.0)
         
         # Load reference depth map
         ref_view = sample['ref_view']
@@ -159,7 +173,7 @@ class DTUDataset(Dataset):
         depth_map = self._load_pfm(depth_path)
         
         # Resize depth map to match image resolution
-        depth_map = cv2.resize(depth_map, (self.img_width, self.img_height))
+        depth_map = cv2.resize(depth_map, (self.img_width, self.img_height), interpolation=cv2.INTER_NEAREST)
         depth_map = torch.from_numpy(depth_map).float()
         
         # Load camera parameters
@@ -174,7 +188,7 @@ class DTUDataset(Dataset):
             depth_min = 0.1
             depth_max = 100.0
             
-        depth_values = torch.linspace(depth_min, depth_max, 64)
+        depth_values = torch.linspace(depth_min, depth_max, self.num_depths)
         
         # Create mask for valid depth values
         mask = (depth_map > 0).float()
